@@ -4,7 +4,7 @@ An AI-powered customer support triage system built with **LangGraph**, **FastAPI
 
 ## Features
 
-- **Classification** of each message by category (`refund`, `product`, `order_status`, `other`) and sentiment (`angry`, `negative`, `neutral`, `positive`), using Claude with a keyword-pattern fallback.
+- **Classification** of each message by category (`refund`, `product`, `order_status`, `other`) and sentiment (`angry`, `negative`, `neutral`, `positive`), using an LLM with a keyword-pattern fallback.
 - **Order lookup** and **refund eligibility checks** (order exists, belongs to the customer, not already refunded, within the refund window).
 - **Human-in-the-loop approval** for refunds above the threshold. The graph pauses via LangGraph `interrupt()` and resumes when an agent decides.
 - **Draft, review, rewrite loop**: replies are quality-checked and rewritten up to a maximum number of times before finalizing.
@@ -57,7 +57,9 @@ Agent/
 ## How It Works
 
 ### Agent graph
-![alt text](<Activity.drawio (3).png>)
+
+![Agent graph](<Activity.drawio (3).png>)
+
 ### Memory
 
 The graph's `thread_id` is the `customer_id`. That single choice gives each customer their own persistent conversation state, so follow-up messages reuse the previously mentioned order.
@@ -70,16 +72,14 @@ If a refund exceeds the threshold, the graph pauses at `human_approval`, the fro
 
 ## Business Rules
 
-Configured in `backend/app/config.py`:
+Configured in `.env` and loaded by `backend/app/config.py`:
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `REFUND_APPROVAL_THRESHOLD` | 100 | Refunds above this amount need agent approval |
-| `REFUND_WINDOW_DAYS` | 30 | Orders older than this are ineligible |
-| `MAX_REWRITES` | 2 | Maximum draft rewrites after a failed quality check |
-| `CHECKPOINT_DB` | empty | SQLite path for persistent checkpoints; empty uses in-memory |
-| `FORCE_QC_FAIL` | false | Forces quality check failures, for testing the rewrite loop |
-| `SECRET_KEY`, `ALGORITHM`, `TOKEN_EXPIRE_MINUTES` | n/a | JWT settings |
+| Setting | Meaning |
+| --- | --- |
+| `REFUND_APPROVAL_THRESHOLD` | Refunds above this amount need agent approval |
+| `REFUND_WINDOW_DAYS` | Orders older than this many days are ineligible for a refund |
+| `MAX_RETRIES` | Maximum draft rewrites after a failed quality check |
+| `JWT_SECRET_KEY`, `ALGORITHUM` | JWT signing key and algorithm |
 
 ## Getting Started
 
@@ -95,22 +95,31 @@ pip install -r requirements.txt
 
 ### 2. Configure
 
-```bash
-```
-
 Create a `.env` file in the project root (it is git-ignored):
 
 ```
-GROQ_API_KEY=Add api key here
-MODEL_NAME=Add model name here
-DATABASE_URL=Add databse url here
-JWT_SECRET_KEY=Add your screat key
-ADMIN_CODE=Add you admin code here
-ALGORITHUM=Add jwt algorithum here
-REFUND_APPROVAL_THRESHOLD=Add amount of threshold
-REFUND_WINDOW_DAYS=Add refund days
-MAX_RETRIES=Add how many retries occur in the system
+GROQ_API_KEY=your-groq-api-key
+MODEL_NAME=your-model-name
+DATABASE_URL=your-database-url
+JWT_SECRET_KEY=your-secret-key
+ADMIN_CODE=your-admin-code
+ALGORITHUM=your-jwt-algorithm
+REFUND_APPROVAL_THRESHOLD=100
+REFUND_WINDOW_DAYS=30
+MAX_RETRIES=2
 ```
+
+| Variable | Description |
+| --- | --- |
+| `GROQ_API_KEY` | Groq API key. Optional: fallbacks are used if empty |
+| `MODEL_NAME` | Groq model to use |
+| `DATABASE_URL` | Database connection URL |
+| `JWT_SECRET_KEY` | Secret used to sign login tokens |
+| `ADMIN_CODE` | Admin code for agent access |
+| `ALGORITHUM` | JWT algorithm, for example `HS256` |
+| `REFUND_APPROVAL_THRESHOLD` | Refund amount above which approval is needed |
+| `REFUND_WINDOW_DAYS` | Number of days an order stays refundable |
+| `MAX_RETRIES` | Number of reply rewrites allowed |
 
 ### 3. Run the backend
 
@@ -148,48 +157,4 @@ All routes are mounted under `/api`.
 | --- | --- | --- | --- |
 | GET | `/api/health` | public | Server health check |
 | POST | `/api/auth/login` | public | Returns a JWT with role and customer_id |
-| GET | `/api/auth/me` | logged in | Current user |
-| POST | `/api/chat/send` | customer | Send a message; 409 if an approval is pending |
-| POST | `/api/chat/stream` | customer | Same, streamed as server-sent events |
-| GET | `/api/chat/history` | customer | Conversation memory |
-| GET | `/api/approvals/{customer_id}` | agent | Pending approval, if any |
-| POST | `/api/approvals/{customer_id}` | agent | Approve or reject; 409 if nothing is pending |
-| POST | `/api/approvals/{customer_id}/stream` | agent | Same, streamed |
-| GET | `/api/customers` | agent | List customers |
-| GET | `/api/tickets/samples` | logged in | Sample tickets |
-
-`customer_id` for chat routes always comes from the token, never from the request body.
-
-Streaming endpoints respond with `text/event-stream`. Event types: `step`, `awaiting_approval`, `done`, `error`.
-
-## Sample Tickets
-
-`backend/app/data/samples.py` contains 10 tickets covering the main paths:
-
-| Scenario | Expected behavior |
-| --- | --- |
-| Order status (T01) | Order lookup, then reply |
-| Memory follow-up (T02) | Finds the order without a number in the message |
-| Two ineligible refunds | Polite denial with reason (outside window, already refunded) |
-| Small refund | Processed automatically |
-| Large refund, approved (T06) | Pauses for approval, then refunds |
-| Large refund, rejected (T07) | Pauses for approval, then denial reply |
-| Product question | FAQ search |
-| Angry customer (T09) | Escalated to a human |
-| Unclear message (T10) | Escalated to a human |
-
-## Testing the Flow
-
-1. Open `/docs` and try, in order: health, customer login, Authorize with the token, send a message, send a refund above $100 (expect "awaiting approval"), then log in as the agent and approve.
-2. Start the frontend and run through: T01 then T02 (memory), a small refund, T06 (approval card on the agent screen), T07 (rejection), and T09 / T10 (escalation).
-
-## Development Notes
-
-- **One file, one check.** Test each file before starting the next.
-- **Add new state fields to `agent/state.py` first.** LangGraph silently ignores fields that are not declared in the state.
-- **`human_approval` placement:** `interrupt()` must come first in the node and nothing with side effects before it, because the node re-runs from the start on resume.
-- **Streamlit reruns on every click.** Keep anything that must persist in `st.session_state`, and ask the backend whether an approval is pending.
-- `llm/client.py` is the only module that talks to Claude.
-- Every backend package folder needs an empty `__init__.py`; `frontend/` does not.
-- `frontend/app.py` is organized top to bottom as: setup, backend-calling functions, UI pieces, action functions, page flow.
-
+| GET | `/api/auth/me` | logged in | Current
